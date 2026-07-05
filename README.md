@@ -1,32 +1,38 @@
 # nestor-voice
 
-Voix de **Nestor**, l'assistant domotique : un majordome très formel mais caustique
-(façon GLaDOS), au timbre mi-lapin (Nabaztag) mi-synthétique.
+Voix domotiques servies à Home Assistant via une **passerelle Wyoming**. Chaque voix
+= une **voix ElevenLabs figée** + une **coloration DSP** (ffmpeg : pitch, ring-modulation,
+chœur, chambre métallique).
 
-Le rendu final = une **voix ElevenLabs figée** + une **coloration DSP** (ffmpeg :
-pitch, ring-modulation, chœur, chambre métallique), servie à Home Assistant via une
-**passerelle Wyoming**.
+Voix exposées :
+- **Nestor** — majordome très formel mais caustique (façon GLaDOS), timbre mi-lapin
+  (Nabaztag) mi-synthétique.
+- **Skippy** — l'IA Elder arrogante et théâtrale (*Expeditionary Force*), baryton
+  « canette » façon Luchini + patine métallique (ring-mod 90 Hz).
 
 ## Passerelle TTS (production)
 
 `gateway/server.py` — serveur Wyoming pour Home Assistant :
 
 ```
-texte  →  ElevenLabs (voice_id figé)  →  coloration Nestor (ffmpeg)  →  PCM  →  HA
+texte + voix demandée  →  ElevenLabs (voice_id)  →  coloration DSP (ffmpeg)  →  PCM  →  HA
 ```
 
-- Aligné sur l'intégration HA ElevenLabs officielle (`eleven_multilingual_v2`,
-  `mp3_44100_128`, voice_settings stability 0.5 / similarity 0.75 / style 0 / speaker_boost).
+- **Multi-voix** : HA choisit la voix dans son sélecteur (`nestor` ou `skippy`) ; le
+  serveur route vers le bon `voice_id` + le bon filtre. Voix par défaut si non précisée.
+- Aligné sur l'intégration HA ElevenLabs officielle (`eleven_multilingual_v2`, `mp3_44100_128`).
 - Cache disque : les phrases déjà synthétisées sont resservies instantanément
-  (latence nulle, zéro crédit).
-- Filtre défini une seule fois dans `nestor_fx.py` (source de vérité), réutilisé partout.
+  (latence nulle, zéro crédit) ; la clé de cache intègre la voix.
+- Registre des profils DSP dans `nestor_fx.py` (source de vérité), réutilisé partout.
 
 ### Configuration (variables d'environnement)
 
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `ELEVENLABS_API_KEY` | — | **requis** |
-| `NESTOR_VOICE_ID` | `yY3c56wtYbsunxZsENmx` | voix ElevenLabs figée |
+| `NESTOR_VOICE_ID` | `yY3c56wtYbsunxZsENmx` | voice_id ElevenLabs de la voix `nestor` |
+| `SKIPPY_VOICE_ID` | `xwOTosRH5SpGGYsxw4Jt` | voice_id ElevenLabs de la voix `skippy` |
+| `NESTOR_DEFAULT_VOICE` | `nestor` | voix utilisée si HA n'en précise pas |
 | `NESTOR_MODEL` | `eleven_multilingual_v2` | modèle TTS |
 | `NESTOR_SAMPLE_RATE` | `22050` | fréquence du PCM renvoyé |
 | `NESTOR_URI` | `tcp://0.0.0.0:10200` | écoute Wyoming |
