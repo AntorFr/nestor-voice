@@ -31,7 +31,9 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
-from wyoming.tts import Synthesize
+from wyoming.tts import (
+    Synthesize, SynthesizeChunk, SynthesizeStart, SynthesizeStop,
+    SynthesizeStopped)
 
 import nestor_fx
 
@@ -97,34 +99,53 @@ class NestorHandler(AsyncEventHandler):
     def __init__(self, info_event: Event, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._info_event = info_event
+        self._stream_text: list | None = None  # tampon de texte streaming
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
             await self.write_event(self._info_event)
             return True
 
+        # --- synthese one-shot (texte complet en un evenement) ---
         if Synthesize.is_type(event.type):
-            synth = Synthesize.from_event(event)
-            text = " ".join((synth.text or "").split()).strip()
-            if not text:
-                return True
-            try:
-                pcm = await synth_pcm(text)
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("echec synthese")
-                return True
+            await self._speak(Synthesize.from_event(event).text)
+            return True
 
-            await self.write_event(
-                AudioStart(rate=RATE, width=2, channels=1).event())
-            chunk = 2048
-            for i in range(0, len(pcm), chunk):
-                await self.write_event(AudioChunk(
-                    rate=RATE, width=2, channels=1,
-                    audio=pcm[i:i + chunk]).event())
-            await self.write_event(AudioStop().event())
+        # --- synthese streaming (comme Piper : le texte arrive en morceaux) ---
+        if SynthesizeStart.is_type(event.type):
+            self._stream_text = []
+            return True
+        if SynthesizeChunk.is_type(event.type):
+            if self._stream_text is None:
+                self._stream_text = []
+            self._stream_text.append(SynthesizeChunk.from_event(event).text)
+            return True
+        if SynthesizeStop.is_type(event.type):
+            text = "".join(self._stream_text or [])
+            self._stream_text = None
+            await self._speak(text)
+            await self.write_event(SynthesizeStopped().event())
             return True
 
         return True
+
+    async def _speak(self, text: str) -> None:
+        """Synthetise + colore + emet l'audio Wyoming."""
+        text = " ".join((text or "").split()).strip()
+        if not text:
+            return
+        try:
+            pcm = await synth_pcm(text)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("echec synthese")
+            return
+
+        await self.write_event(AudioStart(rate=RATE, width=2, channels=1).event())
+        chunk = 2048
+        for i in range(0, len(pcm), chunk):
+            await self.write_event(AudioChunk(
+                rate=RATE, width=2, channels=1, audio=pcm[i:i + chunk]).event())
+        await self.write_event(AudioStop().event())
 
 
 async def main() -> None:
@@ -138,6 +159,7 @@ async def main() -> None:
         description="Nestor — majordome domotique (ElevenLabs + coloration DSP)",
         attribution=Attribution(name="antor", url="https://antor.fr"),
         installed=True, version=VERSION,
+        supports_synthesize_streaming=True,
         voices=[TtsVoice(
             name="nestor", description="Voix de Nestor (FR)",
             attribution=Attribution(name="ElevenLabs + DSP Nestor", url=""),
