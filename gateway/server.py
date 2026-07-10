@@ -51,10 +51,11 @@ VERSION = os.environ.get("NESTOR_VERSION", "1.0.0")
 
 # Modele Piper local pour Skippy (clone vocal, entraine hors ligne).
 SKIPPY_PIPER_MODEL = os.environ.get("SKIPPY_PIPER_MODEL", "/models/skippy-v2-5h.onnx")
-# Debit de la voix : impose EXPLICITEMENT ici (>1 = plus lent) pour ne pas dependre
-# du length_scale du .onnx.json monte (qui pourrait etre un defaut a 1.0). 1.2 valide
-# a l'oreille. Mettre "" pour laisser le json decider.
-SKIPPY_LENGTH_SCALE = os.environ.get("SKIPPY_LENGTH_SCALE", "1.2").strip()
+# Debit de la voix. PAR DEFAUT vide -> c'est le length_scale du .onnx.json qui decide :
+# le debit est une propriete du MODELE, donc il voyage avec lui (reentrainer = juste
+# livrer un nouveau json, sans toucher au code). La variable reste une soupape optionnelle
+# pour forcer un debit (>1 = plus lent) sans remplacer le modele.
+SKIPPY_LENGTH_SCALE = os.environ.get("SKIPPY_LENGTH_SCALE", "").strip()
 
 # Registre des voix exposees a HA. Chaque voix a un "backend" :
 #   - "elevenlabs" : voice_id + settings (nestor)
@@ -110,8 +111,8 @@ def _tts_mp3(text: str, voice: str) -> bytes:
 def _tts_piper(text: str, voice: str) -> bytes:
     """Synthese locale Piper -> wav (bytes). Execute dans un thread.
 
-    Le debit (length_scale) est impose via SKIPPY_LENGTH_SCALE si defini, sinon
-    laisse au .onnx.json. ffmpeg detecte le format en aval, wav transparent.
+    Le debit (length_scale) vient du .onnx.json ; SKIPPY_LENGTH_SCALE ne le surcharge
+    que s'il est defini. ffmpeg detecte le format en aval, wav transparent.
     """
     model = VOICES[voice]["piper_model"]
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
