@@ -15,9 +15,12 @@ COPY nestor_fx.py .
 COPY gateway/server.py .
 
 ENV NESTOR_URI=tcp://0.0.0.0:10200 \
-    NESTOR_CACHE_DIR=/data/cache
+    NESTOR_CACHE_DIR=/data/cache \
+    SKIPPY_PIPER_MODEL=/models/skippy-v2-5h.onnx
 
+# Modele Piper de skippy : monte en volume (/models via le chart Helm), JAMAIS
+# embarque dans cette image publique. Doit contenir .onnx ET .onnx.json.
 EXPOSE 10200
-VOLUME ["/data"]
+VOLUME ["/data", "/models"]
 
 CMD ["python", "server.py"]

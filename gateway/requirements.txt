@@ -1,1 +1,2 @@
 wyoming>=1.5,<2
+piper-tts>=1.4,<2   # voix skippy en local (modele .onnx monte dans /models)

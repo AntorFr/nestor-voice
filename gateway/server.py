@@ -22,6 +22,9 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 import urllib.request
 import urllib.error
 from functools import partial
@@ -46,23 +49,39 @@ URI = os.environ.get("NESTOR_URI", "tcp://0.0.0.0:10200")
 CACHE_DIR = Path(os.environ.get("NESTOR_CACHE_DIR", "/data/cache"))
 VERSION = os.environ.get("NESTOR_VERSION", "1.0.0")
 
-# Registre des voix exposees a HA : nom Wyoming -> voice_id ElevenLabs + reglages.
+# Modele Piper local pour Skippy (clone vocal, entraine hors ligne).
+# Le .onnx.json accole porte length_scale=1.2 (debit de la voix).
+SKIPPY_PIPER_MODEL = os.environ.get("SKIPPY_PIPER_MODEL", "/models/skippy-v2-5h.onnx")
+
+# Registre des voix exposees a HA. Chaque voix a un "backend" :
+#   - "elevenlabs" : voice_id + settings (nestor)
+#   - "piper"      : modele .onnx local (skippy)
 # Le profil DSP de meme nom vit dans nestor_fx.PROFILES.
 VOICES = {
     "nestor": {
+        "backend": "elevenlabs",
         "voice_id": os.environ.get("NESTOR_VOICE_ID", "yY3c56wtYbsunxZsENmx"),
         "settings": {"stability": 0.5, "similarity_boost": 0.75,
                      "style": 0.0, "use_speaker_boost": True},
         "description": "Voix de Nestor (FR) — majordome domotique caustique",
     },
     "skippy": {
-        "voice_id": os.environ.get("SKIPPY_VOICE_ID", "xwOTosRH5SpGGYsxw4Jt"),
-        "settings": {"stability": 0.4, "similarity_boost": 0.85,
-                     "style": 0.55, "use_speaker_boost": True},
-        "description": "Voix de Skippy le Magnifique (FR) — IA Elder arrogante",
+        "backend": "piper",
+        "piper_model": SKIPPY_PIPER_MODEL,
+        "description": "Voix de Skippy le Magnifique (FR) — clone vocal local + voile canette",
     },
 }
 DEFAULT_VOICE = os.environ.get("NESTOR_DEFAULT_VOICE", "nestor")
+
+
+def _backend(voice: str) -> str:
+    return VOICES[voice].get("backend", "elevenlabs")
+
+
+def _voice_ident(voice: str) -> str:
+    """Identite de la voix pour la cle de cache (voice_id ou chemin du modele)."""
+    cfg = VOICES[voice]
+    return cfg.get("voice_id") or cfg.get("piper_model", "")
 
 
 def _resolve(name: str | None) -> str:
@@ -85,9 +104,40 @@ def _tts_mp3(text: str, voice: str) -> bytes:
         return resp.read()
 
 
+def _tts_piper(text: str, voice: str) -> bytes:
+    """Synthese locale Piper -> wav (bytes). Execute dans un thread.
+
+    Le debit (length_scale) est lu depuis le .onnx.json accole, pas impose ici.
+    ffmpeg detecte le format en aval, donc renvoyer du wav est transparent.
+    """
+    model = VOICES[voice]["piper_model"]
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        out = tf.name
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "piper", "-m", model,
+             "--data-dir", os.path.dirname(model) or ".", "-f", out],
+            input=text.encode(), capture_output=True)
+        if proc.returncode != 0 or not os.path.getsize(out):
+            raise RuntimeError(f"piper: {proc.stderr.decode(errors='replace')[-300:]}")
+        return Path(out).read_bytes()
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def _tts_audio(text: str, voice: str) -> bytes:
+    """Audio encode (mp3 ou wav) selon le backend de la voix."""
+    return _tts_piper(text, voice) if _backend(voice) == "piper" else _tts_mp3(text, voice)
+
+
 def _cache_key(text: str, voice: str) -> str:
     h = hashlib.sha256()
-    h.update("|".join([text, VOICES[voice]["voice_id"], MODEL, str(RATE),
+    # identite = voice_id (ElevenLabs) OU chemin du modele (Piper) ; le backend
+    # entre dans la cle pour ne pas resservir un audio d'une source differente.
+    h.update("|".join([text, _backend(voice), _voice_ident(voice), MODEL, str(RATE),
                        nestor_fx.filter_complex(voice)]).encode())
     return h.hexdigest()
 
@@ -99,15 +149,15 @@ async def synth_pcm(text: str, voice: str) -> bytes:
         _LOGGER.info("cache HIT [%s]: %r", voice, text[:60])
         return cache_file.read_bytes()
 
-    _LOGGER.info("synthese [%s]: %r", voice, text[:60])
+    _LOGGER.info("synthese [%s/%s]: %r", voice, _backend(voice), text[:60])
     loop = asyncio.get_running_loop()
-    mp3 = await loop.run_in_executor(None, _tts_mp3, text, voice)
+    audio = await loop.run_in_executor(None, _tts_audio, text, voice)
 
     proc = await asyncio.create_subprocess_exec(
         *nestor_fx.ffmpeg_pcm_cmd("pipe:0", RATE, voice),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE)
-    pcm, err = await proc.communicate(mp3)
+    pcm, err = await proc.communicate(audio)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg: {err.decode(errors='replace')}")
 
@@ -174,8 +224,12 @@ class NestorHandler(AsyncEventHandler):
 
 async def main() -> None:
     logging.basicConfig(level=os.environ.get("NESTOR_LOG", "INFO"))
-    if not API_KEY:
-        raise SystemExit("ELEVENLABS_API_KEY manquant")
+    # La cle n'est requise que si une voix passe reellement par ElevenLabs.
+    if any(_backend(v) == "elevenlabs" for v in VOICES) and not API_KEY:
+        raise SystemExit("ELEVENLABS_API_KEY manquant (requis par une voix ElevenLabs)")
+    for v in VOICES:
+        if _backend(v) == "piper" and not Path(VOICES[v]["piper_model"]).exists():
+            _LOGGER.warning("voix %s: modele Piper introuvable (%s)", v, VOICES[v]["piper_model"])
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     info = Info(tts=[TtsProgram(
