@@ -36,6 +36,7 @@ texte + voix demandée  →  moteur TTS (ElevenLabs | Piper local)  →  colorat
 | `ELEVENLABS_API_KEY` | — | requis **si** une voix ElevenLabs est exposée (nestor) |
 | `NESTOR_VOICE_ID` | `yY3c56wtYbsunxZsENmx` | voice_id ElevenLabs de la voix `nestor` |
 | `SKIPPY_PIPER_MODEL` | `/models/skippy-v2-5h.onnx` | modèle Piper de la voix `skippy` (+ `.onnx.json` accolé) |
+| `SKIPPY_LENGTH_SCALE` | `1.2` | débit de skippy (>1 = plus lent) ; imposé au CLI Piper, indépendant du `.onnx.json`. `""` = laisser le json décider |
 | `NESTOR_DEFAULT_VOICE` | `nestor` | voix utilisée si HA n'en précise pas |
 | `NESTOR_MODEL` | `eleven_multilingual_v2` | modèle TTS ElevenLabs |
 | `NESTOR_SAMPLE_RATE` | `22050` | fréquence du PCM renvoyé |

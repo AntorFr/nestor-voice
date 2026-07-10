@@ -50,8 +50,11 @@ CACHE_DIR = Path(os.environ.get("NESTOR_CACHE_DIR", "/data/cache"))
 VERSION = os.environ.get("NESTOR_VERSION", "1.0.0")
 
 # Modele Piper local pour Skippy (clone vocal, entraine hors ligne).
-# Le .onnx.json accole porte length_scale=1.2 (debit de la voix).
 SKIPPY_PIPER_MODEL = os.environ.get("SKIPPY_PIPER_MODEL", "/models/skippy-v2-5h.onnx")
+# Debit de la voix : impose EXPLICITEMENT ici (>1 = plus lent) pour ne pas dependre
+# du length_scale du .onnx.json monte (qui pourrait etre un defaut a 1.0). 1.2 valide
+# a l'oreille. Mettre "" pour laisser le json decider.
+SKIPPY_LENGTH_SCALE = os.environ.get("SKIPPY_LENGTH_SCALE", "1.2").strip()
 
 # Registre des voix exposees a HA. Chaque voix a un "backend" :
 #   - "elevenlabs" : voice_id + settings (nestor)
@@ -107,17 +110,18 @@ def _tts_mp3(text: str, voice: str) -> bytes:
 def _tts_piper(text: str, voice: str) -> bytes:
     """Synthese locale Piper -> wav (bytes). Execute dans un thread.
 
-    Le debit (length_scale) est lu depuis le .onnx.json accole, pas impose ici.
-    ffmpeg detecte le format en aval, donc renvoyer du wav est transparent.
+    Le debit (length_scale) est impose via SKIPPY_LENGTH_SCALE si defini, sinon
+    laisse au .onnx.json. ffmpeg detecte le format en aval, wav transparent.
     """
     model = VOICES[voice]["piper_model"]
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         out = tf.name
+    argv = [sys.executable, "-m", "piper", "-m", model,
+            "--data-dir", os.path.dirname(model) or ".", "-f", out]
+    if SKIPPY_LENGTH_SCALE:
+        argv += ["--length-scale", SKIPPY_LENGTH_SCALE]
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "piper", "-m", model,
-             "--data-dir", os.path.dirname(model) or ".", "-f", out],
-            input=text.encode(), capture_output=True)
+        proc = subprocess.run(argv, input=text.encode(), capture_output=True)
         if proc.returncode != 0 or not os.path.getsize(out):
             raise RuntimeError(f"piper: {proc.stderr.decode(errors='replace')[-300:]}")
         return Path(out).read_bytes()
@@ -137,7 +141,8 @@ def _cache_key(text: str, voice: str) -> str:
     h = hashlib.sha256()
     # identite = voice_id (ElevenLabs) OU chemin du modele (Piper) ; le backend
     # entre dans la cle pour ne pas resservir un audio d'une source differente.
-    h.update("|".join([text, _backend(voice), _voice_ident(voice), MODEL, str(RATE),
+    ls = SKIPPY_LENGTH_SCALE if _backend(voice) == "piper" else ""
+    h.update("|".join([text, _backend(voice), _voice_ident(voice), MODEL, ls, str(RATE),
                        nestor_fx.filter_complex(voice)]).encode())
     return h.hexdigest()
 
