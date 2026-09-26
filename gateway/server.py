@@ -185,6 +185,11 @@ class NestorHandler(AsyncEventHandler):
 
         # --- synthese one-shot (texte complet en un evenement) ---
         if Synthesize.is_type(event.type):
+            # En streaming, HA renvoie aussi le texte complet dans un Synthesize
+            # (compat. anciens serveurs) entre Start et Stop : l'ignorer, sinon
+            # chaque phrase est dite deux fois (une ici, une au SynthesizeStop).
+            if self._stream_text is not None:
+                return True
             syn = Synthesize.from_event(event)
             await self._speak(syn.text, _resolve(getattr(syn.voice, "name", None)))
             return True
