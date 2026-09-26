@@ -30,6 +30,7 @@ import urllib.error
 from functools import partial
 from pathlib import Path
 
+from sentence_stream import SentenceBoundaryDetector
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
@@ -172,11 +173,16 @@ async def synth_pcm(text: str, voice: str) -> bytes:
 
 
 class NestorHandler(AsyncEventHandler):
+    """Un message = un flux audio (AudioStart .. AudioStop), synthetise phrase par
+    phrase : la premiere phrase part des qu'elle est complete, sans attendre la fin
+    du texte (streaming Wyoming, comme wyoming-piper)."""
+
     def __init__(self, info_event: Event, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._info_event = info_event
-        self._stream_text: list | None = None  # tampon de texte streaming
+        self._sbd: SentenceBoundaryDetector | None = None  # non-None = stream en cours
         self._stream_voice: str = DEFAULT_VOICE  # voix du stream en cours
+        self._audio_started = False  # AudioStart deja emis pour le message en cours
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -187,35 +193,41 @@ class NestorHandler(AsyncEventHandler):
         if Synthesize.is_type(event.type):
             # En streaming, HA renvoie aussi le texte complet dans un Synthesize
             # (compat. anciens serveurs) entre Start et Stop : l'ignorer, sinon
-            # chaque phrase est dite deux fois (une ici, une au SynthesizeStop).
-            if self._stream_text is not None:
+            # chaque phrase est dite deux fois.
+            if self._sbd is not None:
                 return True
             syn = Synthesize.from_event(event)
-            await self._speak(syn.text, _resolve(getattr(syn.voice, "name", None)))
+            voice = _resolve(getattr(syn.voice, "name", None))
+            sbd = SentenceBoundaryDetector()
+            for sentence in [*sbd.add_chunk(syn.text), sbd.finish()]:
+                await self._speak(sentence, voice)
+            await self._end_audio()
             return True
 
-        # --- synthese streaming (comme Piper : le texte arrive en morceaux) ---
+        # --- synthese streaming (le texte arrive en morceaux depuis le LLM) ---
         if SynthesizeStart.is_type(event.type):
             start = SynthesizeStart.from_event(event)
             self._stream_voice = _resolve(getattr(start.voice, "name", None))
-            self._stream_text = []
+            self._sbd = SentenceBoundaryDetector()
             return True
         if SynthesizeChunk.is_type(event.type):
-            if self._stream_text is None:
-                self._stream_text = []
-            self._stream_text.append(SynthesizeChunk.from_event(event).text)
+            if self._sbd is None:
+                self._sbd = SentenceBoundaryDetector()
+            for sentence in self._sbd.add_chunk(SynthesizeChunk.from_event(event).text):
+                await self._speak(sentence, self._stream_voice)
             return True
         if SynthesizeStop.is_type(event.type):
-            text = "".join(self._stream_text or [])
-            self._stream_text = None
-            await self._speak(text, self._stream_voice)
+            if self._sbd is not None:
+                await self._speak(self._sbd.finish(), self._stream_voice)
+                self._sbd = None
+            await self._end_audio()
             await self.write_event(SynthesizeStopped().event())
             return True
 
         return True
 
     async def _speak(self, text: str, voice: str = DEFAULT_VOICE) -> None:
-        """Synthetise + colore + emet l'audio Wyoming."""
+        """Synthetise + colore + emet l'audio d'une phrase (AudioStart a la 1re)."""
         text = " ".join((text or "").split()).strip()
         if not text:
             return
@@ -225,12 +237,19 @@ class NestorHandler(AsyncEventHandler):
             _LOGGER.exception("echec synthese")
             return
 
-        await self.write_event(AudioStart(rate=RATE, width=2, channels=1).event())
+        if not self._audio_started:
+            await self.write_event(AudioStart(rate=RATE, width=2, channels=1).event())
+            self._audio_started = True
         chunk = 2048
         for i in range(0, len(pcm), chunk):
             await self.write_event(AudioChunk(
                 rate=RATE, width=2, channels=1, audio=pcm[i:i + chunk]).event())
-        await self.write_event(AudioStop().event())
+
+    async def _end_audio(self) -> None:
+        """Clot le flux audio du message (rien si aucune phrase n'a ete emise)."""
+        if self._audio_started:
+            await self.write_event(AudioStop().event())
+            self._audio_started = False
 
 
 async def main() -> None:
