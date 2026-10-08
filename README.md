@@ -42,6 +42,12 @@ texte + voix demandée  →  moteur TTS (ElevenLabs | Piper local)  →  colorat
 | `NESTOR_SAMPLE_RATE` | `22050` | fréquence du PCM renvoyé |
 | `NESTOR_URI` | `tcp://0.0.0.0:10200` | écoute Wyoming |
 | `NESTOR_CACHE_DIR` | `/data/cache` | cache PCM |
+| `NESTOR_LOG` | `INFO` | niveau de log |
+
+**Trace de diagnostic** (niveau INFO) : chaque connexion HA porte un id `[cN +t]` ;
+le log liste les évènements Wyoming reçus (texte verbatim), chaque phrase émise avec sa
+durée d'audio, et un bilan à la déconnexion. Une parole doublée s'y lit directement :
+deux connexions, un texte reçu deux fois, ou deux fois plus d'audio émis que prévu.
 
 Le modèle Piper de Skippy (`.onnx` + `.onnx.json`) est **monté en volume** (`/models`),
 **jamais commité dans ce repo public** ni embarqué dans l'image (il est versionné à part,

@@ -19,12 +19,14 @@ le reste (Wyoming + filtre + cache) ne bouge pas.
 """
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import urllib.error
 from functools import partial
@@ -172,10 +174,24 @@ async def synth_pcm(text: str, voice: str) -> bytes:
     return pcm
 
 
+_CONN_IDS = itertools.count(1)
+
+
+def _sec(pcm_bytes: int) -> float:
+    """Duree (s) d'un PCM s16le mono a RATE."""
+    return pcm_bytes / 2 / RATE
+
+
 class NestorHandler(AsyncEventHandler):
     """Un message = un flux audio (AudioStart .. AudioStop), synthetise phrase par
     phrase : la premiere phrase part des qu'elle est complete, sans attendre la fin
-    du texte (streaming Wyoming, comme wyoming-piper)."""
+    du texte (streaming Wyoming, comme wyoming-piper).
+
+    Trace de diagnostic : chaque connexion HA a un id [cN] ; on journalise chaque
+    evenement recu (texte verbatim), chaque phrase emise, et un bilan a la
+    deconnexion. Sert a localiser une parole doublee : deux connexions, un texte
+    recu deux fois, ou un audio emis deux fois se lisent directement dans les logs.
+    """
 
     def __init__(self, info_event: Event, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -183,9 +199,36 @@ class NestorHandler(AsyncEventHandler):
         self._sbd: SentenceBoundaryDetector | None = None  # non-None = stream en cours
         self._stream_voice: str = DEFAULT_VOICE  # voix du stream en cours
         self._audio_started = False  # AudioStart deja emis pour le message en cours
+        # --- trace ---
+        self._cid = next(_CONN_IDS)
+        self._t0 = time.monotonic()
+        self._msg_sentences = 0  # phrases emises dans le message en cours
+        self._msg_bytes = 0  # octets PCM emis dans le message en cours
+        self._tot_messages = 0
+        self._tot_sentences = 0
+        self._tot_bytes = 0
+        peer = self.writer.get_extra_info("peername")
+        self._log("connexion de %s", f"{peer[0]}:{peer[1]}" if peer else "?")
+
+    def _log(self, fmt: str, *args) -> None:
+        _LOGGER.info("[c%d +%.2fs] " + fmt, self._cid, time.monotonic() - self._t0, *args)
+
+    async def disconnect(self) -> None:
+        if self._sbd is not None:
+            self._log("ATTENTION stream non clos (pas de synthesize-stop recu)")
+        self._log("deconnexion — %d message(s), %d phrase(s), %.2fs d'audio emis",
+                  self._tot_messages, self._tot_sentences, _sec(self._tot_bytes))
 
     async def handle_event(self, event: Event) -> bool:
+        try:
+            return await self._handle(event)
+        except Exception:
+            self._log("ERREUR en traitant %s", event.type)
+            raise
+
+    async def _handle(self, event: Event) -> bool:
         if Describe.is_type(event.type):
+            self._log("recu describe")
             await self.write_event(self._info_event)
             return True
 
@@ -194,10 +237,14 @@ class NestorHandler(AsyncEventHandler):
             # En streaming, HA renvoie aussi le texte complet dans un Synthesize
             # (compat. anciens serveurs) entre Start et Stop : l'ignorer, sinon
             # chaque phrase est dite deux fois.
-            if self._sbd is not None:
-                return True
             syn = Synthesize.from_event(event)
+            if self._sbd is not None:
+                self._log("recu synthesize (texte complet, IGNORE car stream en cours): %r",
+                          syn.text)
+                return True
             voice = _resolve(getattr(syn.voice, "name", None))
+            self._log("recu synthesize one-shot voix=%s (demandee %r): %r", voice,
+                      getattr(syn.voice, "name", None), syn.text)
             sbd = SentenceBoundaryDetector()
             for sentence in [*sbd.add_chunk(syn.text), sbd.finish()]:
                 await self._speak(sentence, voice)
@@ -208,22 +255,32 @@ class NestorHandler(AsyncEventHandler):
         if SynthesizeStart.is_type(event.type):
             start = SynthesizeStart.from_event(event)
             self._stream_voice = _resolve(getattr(start.voice, "name", None))
+            if self._sbd is not None:
+                self._log("ATTENTION synthesize-start alors qu'un stream est deja ouvert")
             self._sbd = SentenceBoundaryDetector()
+            self._log("recu synthesize-start voix=%s (demandee %r)", self._stream_voice,
+                      getattr(start.voice, "name", None))
             return True
         if SynthesizeChunk.is_type(event.type):
+            chunk_text = SynthesizeChunk.from_event(event).text
+            self._log("recu synthesize-chunk: %r", chunk_text)
             if self._sbd is None:
+                self._log("ATTENTION chunk hors stream (pas de synthesize-start)")
                 self._sbd = SentenceBoundaryDetector()
-            for sentence in self._sbd.add_chunk(SynthesizeChunk.from_event(event).text):
+            for sentence in self._sbd.add_chunk(chunk_text):
                 await self._speak(sentence, self._stream_voice)
             return True
         if SynthesizeStop.is_type(event.type):
+            self._log("recu synthesize-stop")
             if self._sbd is not None:
                 await self._speak(self._sbd.finish(), self._stream_voice)
                 self._sbd = None
             await self._end_audio()
             await self.write_event(SynthesizeStopped().event())
+            self._log("envoye synthesize-stopped")
             return True
 
+        self._log("recu %s (non gere)", event.type)
         return True
 
     async def _speak(self, text: str, voice: str = DEFAULT_VOICE) -> None:
@@ -231,25 +288,40 @@ class NestorHandler(AsyncEventHandler):
         text = " ".join((text or "").split()).strip()
         if not text:
             return
+        t = time.monotonic()
         try:
             pcm = await synth_pcm(text, voice)
         except Exception:  # noqa: BLE001
-            _LOGGER.exception("echec synthese")
+            _LOGGER.exception("[c%d] echec synthese: %r", self._cid, text)
             return
 
         if not self._audio_started:
             await self.write_event(AudioStart(rate=RATE, width=2, channels=1).event())
             self._audio_started = True
+            self._log("envoye audio-start")
         chunk = 2048
         for i in range(0, len(pcm), chunk):
             await self.write_event(AudioChunk(
                 rate=RATE, width=2, channels=1, audio=pcm[i:i + chunk]).event())
+        self._msg_sentences += 1
+        self._msg_bytes += len(pcm)
+        self._log("phrase emise [%s] %.2fs d'audio (synthese %.2fs): %r",
+                  voice, _sec(len(pcm)), time.monotonic() - t, text)
 
     async def _end_audio(self) -> None:
         """Clot le flux audio du message (rien si aucune phrase n'a ete emise)."""
         if self._audio_started:
             await self.write_event(AudioStop().event())
             self._audio_started = False
+            self._log("envoye audio-stop — message: %d phrase(s), %.2fs d'audio",
+                      self._msg_sentences, _sec(self._msg_bytes))
+            self._tot_messages += 1
+            self._tot_sentences += self._msg_sentences
+            self._tot_bytes += self._msg_bytes
+        else:
+            self._log("message sans audio (aucune phrase emise)")
+        self._msg_sentences = 0
+        self._msg_bytes = 0
 
 
 async def main() -> None:
