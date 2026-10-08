@@ -207,13 +207,21 @@ class NestorHandler(AsyncEventHandler):
         self._tot_messages = 0
         self._tot_sentences = 0
         self._tot_bytes = 0
+        # Ligne "connexion" differee au 1er evenement : les sondes TCP de k8s
+        # (connexions vides, ~3 / 10 s) ne laissent ainsi aucune trace.
         peer = self.writer.get_extra_info("peername")
-        self._log("connexion de %s", f"{peer[0]}:{peer[1]}" if peer else "?")
+        self._peer = f"{peer[0]}:{peer[1]}" if peer else "?"
+        self._announced = False
 
     def _log(self, fmt: str, *args) -> None:
+        if not self._announced:
+            self._announced = True
+            self._log("connexion de %s", self._peer)
         _LOGGER.info("[c%d +%.2fs] " + fmt, self._cid, time.monotonic() - self._t0, *args)
 
     async def disconnect(self) -> None:
+        if not self._announced:
+            return  # connexion sans evenement (sonde k8s) : rien a tracer
         if self._sbd is not None:
             self._log("ATTENTION stream non clos (pas de synthesize-stop recu)")
         self._log("deconnexion — %d message(s), %d phrase(s), %.2fs d'audio emis",
